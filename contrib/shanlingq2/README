@@ -1,0 +1,116 @@
+Shanling Q2 tools
+=================
+
+The Q2 runs Linux 5.10 on an Ingenic X2000 (MIPS32r2, nan2008) with glibc 2.28, no IPv6 and no CA
+bundle. q2-bandcamp runs from the card's .bandcamp folder as a Q2 Pod card app (q2-pod's
+patch/addon.c): Q2 Pod lists it in Streaming, starts it from that row, draws its page, keeps the Q2
+awake while it downloads and plays its URL queues. Nothing is flashed for it.
+
+  build.sh     static Go for the Q2 and the card files, in target/shanlingq2/.bandcamp, zipped as
+               target/shanlingq2/q2-bandcamp-vX.Y-SHA.zip (unzip that at the card's root)
+  package.py   checks the binary (static, MIPS32 little-endian, soft-float ABI), sets the nan2008
+               ELF flag the Q2's kernel requires and Go doesn't, and writes the ZIP (from
+               q2-filebrowser)
+  launcher.sh  installed as .bandcamp/run: q2-bandcamp copied to /tmp and run there at nice 10 in
+               a restart loop; it notes its starts and restarts in the debug log, and the app's
+               stderr (a crash's message) goes to /tmp/q2-bandcamp.err, which the next start copies
+               into the log
+  q2app        installed as .bandcamp/q2app: the card app manifest (name=Bandcamp, search=Search
+               Bandcamp, qr=0: no phone page)
+  icon.png, icon-40.png
+               installed beside it: Streaming's row icon, 52 px (Legacy) and 40 px (iPod), a white
+               mark on Bandcamp's blue
+  test_launcher.py
+               runs launcher.sh on the host with a fake app
+
+Build
+-----
+
+  contrib/shanlingq2/build.sh [OUT]
+
+Go 1.22 or later and python3. The binary is CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat,
+static, so it needs none of the Q2's libraries and the firmware's -mfp64 doesn't matter. HTTPS is
+checked against Mozilla's CA bundle, which the app carries (internal/tlsroots). On a Q2 whose clock
+was never set, certificates are checked at the time a plain-HTTP Date header gives.
+
+Device
+------
+
+Q2 Pod runs /bin/sh /mnt/mmc/.bandcamp/run when Streaming's Bandcamp row is pressed and it isn't
+running. The launcher copies q2-bandcamp and itself to /tmp and leaves the card at once, so USB
+storage can always take the card. The loop restarts it after a failure, waiting 5 s and doubling to
+a minute, and leaves its pid in /tmp/q2-bandcamp. An exit of 0 (Stop Bandcamp, or idle: nothing to
+download, the page unused 15 minutes and the proxy unused 30) ends the loop. A TERM to it stops
+q2-bandcamp cleanly, the song downloading kept in .bandcamp/partial to resume; an app still there
+15 s after it is killed. Q2 Pod sends it for Stop Streaming Services, Home's Rockbox row, an Apps
+update or remove, and USB storage (after which it starts it again).
+
+  /tmp/q2-bandcamp.state
+      hold (1: a song is downloading), version
+  /tmp/q2-bandcamp.sock
+      datagrams: q quits
+  /tmp/q2-bandcamp.browse.sock
+      Q2SPOT/1 (q2-pod's docs/librespot.md) for the Q2's page, below
+  /tmp/q2-bandcamp.art/<key>.jpg
+      the rows' covers ("art" cap): Bandcamp's 100 px pictures, fetched once into img/ and linked
+      under each row's key (FNV-1a 32 of its uri, a tab and its context); removed at exit
+  /tmp/q2-bandcamp.play, /tmp/q2-bandcamp.urls, /tmp/q2-bandcamp.lyrics/<n>.lrc
+      a queue to play ("urls" cap, q2-pod's patch/tidal.c): .play is "<seq> /tmp/q2-bandcamp.urls";
+      .urls is "#Q2URLS/1<TAB>start=<i>", then a line a song: its URL (or card path, for a song on
+      the card), title, artist, album, cover URL and seconds; a song's lyrics in .lyrics/<n>.lrc
+  /tmp/q2-bandcamp.library
+      "<seq>\nscan\n": Update Local Music asked for ("library" cap), when the queue empties after
+      new songs; Q2 Pod runs it once nothing plays
+  127.0.0.1:8117 (the next free one if taken)
+      the stream proxy, on the loopback only: /t/<kind>/<list>/<track>.mp3 a song (kind album,
+      track, playlist or radio: where it was listed, so its stream address can be asked for again),
+      /b/<show>.mp3 a radio show's broadcast, /i/<a|i><id>.jpg a cover (700 px). Range requests
+      pass through; a stream address is kept 12 hours and asked for again when Bandcamp refuses it
+
+On the card:
+
+  .bandcamp/queue.json   the jobs waiting, the first one under way
+  .bandcamp/done.json    the jobs finished: their folder, songs done, failed and not streamed
+  .bandcamp/partial/<track id>.mp3
+                         a song being downloaded, in 512 KB chunks, each opened, written, synced and
+                         closed (the card is almost never busy); resumed with an HTTP Range; a file
+                         untouched for 3 days is removed at a start
+  Bandcamp/...           the music (README.md, Where the music goes)
+  q2-bandcamp.log        the debug log (q2-bandcamp.old.log: the one before), 512 KB each
+
+The page
+--------
+
+Each row's kind says what a press does (q2-pod's patch/addon.c): list opens a level, action sends an
+op and toasts its reply, search opens the Q2's keyboard (op search), local plays from the card (a
+folder, "/" last, lists its songs; context album: in track order), page moves a long list to its
+previous or next page ("window" cap; without it, the reply's cursor and More…), progress draws a
+bar of its position (permille), info does nothing. A row's position is the op Play/Pause held sends,
+with its context. A reply whose message is "refresh" is asked again every 2 s while on screen: a
+list showing a download under way, the menu while downloads wait, Downloads always. A page is 48
+rows past its Previous and Next rows.
+
+  menu                       New and Notable, Album of the Day, Playlists, Bandcamp Radio, Search
+                             Bandcamp, Downloads, On the Card, Stop Bandcamp
+  nn [cursor], aotd [cursor] top10 nn|aotd, then the 120 latest releases
+  get <page>                 a release downloaded (a press on its row); a failed one again
+  play <page>                a release played (Play/Pause held on its row)
+  playlists, fan <id>        playlists; a row opens playlist <id>
+  playlist <id> [cursor]     playfrom playlist:<id>:0, getlist playlist:<id> (or its folder and
+                             Download Again), then its songs: playfrom, held getalbum
+  radio                      Latest Shows (series "") and each series (series <name>)
+  series <name> [cursor]     its shows, the newest first: show <id>
+  show <id> [cursor]         its blurb, playshow <id>, playfrom radio:<id>:0, getlist radio:<id>,
+                             its songs with their minute
+  search <text>              releases (get, held play), artists and labels (artist <url>), fans (fan
+                             <id>)
+  artist <url> [cursor]      getall <url>, then their releases
+  downloads [cursor]         the bar of the one under way and cancel <key>, the waiting (cancel),
+                             cancelall, the finished (local rows; failures: retry <key>), forget
+  card [cursor]              every finished job still on the card, the newest first
+  stop                       the reply, then the app stops
+
+Keys: a release's is album:<host><path> (its page, so one album from any list is one), a playlist's
+playlist:<id>, a show's radio:<id>. Paths stay under 240 bytes, inside Q2 Pod's 256-byte path buffer
+(songs_open): an artist's folder is at most 50 bytes, an album's 70, a song's 80, with the
+characters FAT refuses replaced by "_".
