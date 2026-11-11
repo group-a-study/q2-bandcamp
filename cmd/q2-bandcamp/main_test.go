@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,9 +30,10 @@ import (
 type fake struct {
 	*httptest.Server
 	mu      sync.Mutex
-	cutOnce map[int64]bool // a stream that breaks off halfway the first time
-	hold    chan struct{}  // while set, streams wait for it to close
-	gets    map[string]int // requests by path
+	cutOnce map[int64]bool  // a stream that breaks off halfway the first time
+	gone    map[string]bool // album pages taken down since
+	hold    chan struct{}   // while set, streams wait for it to close
+	gets    map[string]int  // requests by path
 }
 
 type falbum struct {
@@ -81,7 +83,7 @@ func audio(id int64) []byte {
 var jpeg = []byte{0xff, 0xd8, 0xff, 0xe0, 0, 16, 'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0xff, 0xd9}
 
 func newFake(t *testing.T) *fake {
-	f := &fake{cutOnce: map[int64]bool{}, gets: map[string]int{}}
+	f := &fake{cutOnce: map[int64]bool{}, gone: map[string]bool{}, gets: map[string]int{}}
 	mux := http.NewServeMux()
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -216,8 +218,12 @@ func newFake(t *testing.T) *fake {
 		return map[string]any{"auto": map[string]any{"results": r}}
 	})
 	mux.HandleFunc("/album/", func(w http.ResponseWriter, r *http.Request) {
-		a := albums[strings.TrimPrefix(r.URL.Path, "/album/")]
-		if a == nil {
+		slug := strings.TrimPrefix(r.URL.Path, "/album/")
+		f.mu.Lock()
+		down := f.gone[slug]
+		f.mu.Unlock()
+		a := albums[slug]
+		if a == nil || down {
 			http.NotFound(w, r)
 			return
 		}
@@ -337,7 +343,6 @@ func newRig(t *testing.T, f *fake, base string) *rig {
 	q2.CardMounted = func() bool { return true }
 	transport = func() http.RoundTripper { return http.DefaultTransport }
 	retryGap = 10 * time.Millisecond
-	proxyPort = 0
 	r.d = start(r.dir, filepath.Join(r.card, "Bandcamp"), r.tmp)
 	r.done = make(chan struct{})
 	go func() { r.d.run(); close(r.done) }()
@@ -409,7 +414,7 @@ func rowsOf(rep q2spot.Reply) string {
 	return b.String()
 }
 
-func TestTop10(t *testing.T) {
+func TestTopN(t *testing.T) {
 	f := newFake(t)
 	r := newRig(t, f, "")
 	menu := r.ask("menu")
@@ -418,23 +423,54 @@ func TestTop10(t *testing.T) {
 		t.Fatalf("menu:\n%s", rowsOf(menu))
 	}
 	nn := r.ask("nn")
-	if nn.Status != "" || len(nn.Rows) != 13 || nn.Rows[0].URI != "top10" || nn.Rows[0].Context != "nn" {
+	if nn.Status != "" || len(nn.Rows) != 14 || nn.Rows[0].URI != "top" || nn.Rows[0].Context != "nn" ||
+		nn.Rows[0].Title != "Download the Top 10" || nn.Rows[1].Kind != "list" || nn.Rows[1].URI != "topn" ||
+		nn.Rows[1].Title != "How Many: 10" {
 		t.Fatalf("nn:\n%s", rowsOf(nn))
 	}
-	a0 := nn.Rows[1]
-	if a0.Kind != "action" || a0.URI != "get" || a0.Context != f.URL+"/album/a0" || a0.Position != "play" ||
+	a0 := nn.Rows[2]
+	if a0.Kind != "action" || a0.URI != "get" || a0.Context != f.URL+"/album/a0" || a0.Position != "" ||
 		a0.Title != "Album 0" || a0.Subtitle != "Artist 0 · Electronic" {
 		t.Fatalf("an album's row: %+v", a0)
 	}
 	if _, err := os.Stat(filepath.Join(r.tmp+".art", rowKey(a0)+".jpg")); err != nil {
 		t.Fatalf("its cover: %v", err)
 	}
-	rep := r.ask("top10", "nn")
-	if rep.Message != "Downloading 10 albums" {
-		t.Fatalf("top10: %+v", rep)
+	// How Many, each list its own, 10 until chosen
+	hm := r.ask("topn", "nn")
+	if len(hm.Rows) != len(topChoices) || hm.Rows[3].Title != "Top 10" || hm.Rows[3].Subtitle != "Chosen · The first choice" ||
+		hm.Rows[5].Context != "nn:20" || hm.Rows[5].URI != "setn" {
+		t.Fatalf("how many:\n%s", rowsOf(hm))
+	}
+	if rep := r.ask("setn", "nn:3"); rep.Message != "Download the Top 3" {
+		t.Fatalf("setn: %+v", rep)
+	}
+	if b, _ := os.ReadFile(filepath.Join(r.dir, "settings.json")); !strings.Contains(string(b), `"nn":3`) {
+		t.Fatalf("settings.json: %s", b)
+	}
+	if nn = r.ask("nn"); nn.Rows[0].Title != "Download the Top 3" || nn.Rows[1].Title != "How Many: 3" {
+		t.Fatalf("nn at 3:\n%s", rowsOf(nn))
+	}
+	if aotd := r.ask("aotd"); aotd.Rows[0].Title != "Download the Latest 10" || r.ask("topn", "aotd").Rows[0].Title != "Latest 1" {
+		t.Fatalf("aotd's N isn't its own:\n%s", rowsOf(aotd))
+	}
+	if rep := r.ask("top", "nn"); rep.Message != "Downloading 3 albums" {
+		t.Fatalf("top 3: %+v", rep)
 	}
 	if r.ask("nn").Message != "refresh" && r.d.dl.pending() {
 		t.Fatal("the list isn't live while its albums download")
+	}
+	r.idle()
+	if _, err := os.Stat(filepath.Join(r.card, "Bandcamp", "Artist 3")); err == nil {
+		t.Fatal("the 4th was downloaded")
+	}
+	wait(t, "Update Local Music to be asked for", func() bool {
+		b, err := os.ReadFile(r.tmp + ".library")
+		return err == nil && strings.HasSuffix(string(b), "\nscan\n")
+	})
+	r.ask("setn", "nn:10")
+	if rep := r.ask("top", "nn"); rep.Message != "Downloading 7 albums; passed over 3 on the card" {
+		t.Fatalf("top 10: %+v", rep)
 	}
 	r.idle()
 	for n := 0; n < 10; n++ {
@@ -452,42 +488,171 @@ func TestTop10(t *testing.T) {
 			t.Fatalf("album %d's cover.jpg: %v", n, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(r.card, "Bandcamp", "Artist 10")); err == nil {
-		t.Fatal("the 11th was downloaded")
-	}
-	if b, err := os.ReadFile(r.tmp + ".library"); err != nil || !strings.HasSuffix(string(b), "\nscan\n") {
-		t.Fatalf("Update Local Music wasn't asked for: %q %v", b, err)
-	}
 	if left, _ := os.ReadDir(filepath.Join(r.dir, "partial")); len(left) != 0 {
 		t.Fatalf("partial files left: %v", left)
 	}
 	nn = r.ask("nn")
-	if nn.Rows[1].Kind != "local" || nn.Rows[1].Context != "album" ||
-		nn.Rows[1].URI != filepath.Join(r.card, "Bandcamp", "Artist 0", "2026 - Album 0")+"/" ||
-		nn.Rows[0].Subtitle != "All of them are on the card" || nn.Rows[11].Kind != "action" || nn.Message != "" {
+	if nn.Rows[2].Kind != "local" || nn.Rows[2].Context != "album" ||
+		nn.Rows[2].URI != filepath.Join(r.card, "Bandcamp", "Artist 0", "2026 - Album 0")+"/" ||
+		nn.Rows[2].Position != "del:"+recID(releaseKey(f.URL+"/album/a0")) ||
+		nn.Rows[0].Subtitle != "10 on the card" || nn.Rows[12].Kind != "action" || nn.Message != "" {
 		t.Fatalf("nn after:\n%s", rowsOf(nn))
 	}
-	if rep := r.ask("top10", "nn"); rep.Message != "All 10 are on the card already" {
-		t.Fatalf("top10 again: %+v", rep)
-	}
-	card := r.ask("card")
-	if len(card.Rows) != 10 || card.Rows[0].Kind != "local" {
-		t.Fatalf("on the card:\n%s", rowsOf(card))
+	if rep := r.ask("top", "nn"); rep.Message != "Nothing new: 10 on the card" {
+		t.Fatalf("top again: %+v", rep)
 	}
 	dls := r.ask("downloads")
-	if !strings.Contains(rowsOf(dls), "|Clear Finished|") || dls.Rows[0].Kind != "local" {
+	if !strings.Contains(rowsOf(dls), "|Clear Finished|") || dls.Rows[0].Kind != "local" || !strings.HasPrefix(dls.Rows[0].Position, "del:") {
 		t.Fatalf("downloads:\n%s", rowsOf(dls))
 	}
 	// Album of the Day: the latest 10, the article's album (not the review) as each row's
 	aotd := r.ask("aotd")
-	if aotd.Rows[0].Title != "Download the Latest 10" || aotd.Rows[1].Context != f.URL+"/album/loves-arp" ||
-		aotd.Rows[1].Subtitle != "Dawuna · 6 Nov" || aotd.Rows[2].Kind != "local" {
+	if aotd.Rows[0].Title != "Download the Latest 10" || aotd.Rows[2].Context != f.URL+"/album/loves-arp" ||
+		aotd.Rows[2].Subtitle != "Dawuna · 6 Nov" || aotd.Rows[3].Kind != "local" {
 		t.Fatalf("aotd:\n%s", rowsOf(aotd))
 	}
-	if rep := r.ask("top10", "aotd"); rep.Message != "Downloading 1 album; 9 on the card already" {
+	if rep := r.ask("top", "aotd"); rep.Message != "Downloading 1 album; passed over 9 on the card" {
 		t.Fatalf("latest 10: %+v", rep)
 	}
 	r.idle()
+}
+
+func TestRecordAndDelete(t *testing.T) {
+	f := newFake(t)
+	base := t.TempDir()
+	r := newRig(t, f, base)
+	r.ask("nn")
+	r.ask("setn", "nn:3")
+	r.ask("top", "nn")
+	r.idle()
+	key0, key1 := releaseKey(f.URL+"/album/a0"), releaseKey(f.URL+"/album/a1")
+	id0, id1 := recID(key0), recID(key1)
+	dir1 := filepath.Join(r.card, "Bandcamp", "Artist 1", "2026 - Album 1")
+	record := func() string {
+		b, _ := os.ReadFile(filepath.Join(r.card, "Bandcamp", recordName))
+		return string(b)
+	}
+	if rec := record(); !strings.HasPrefix(rec, "Kind\tTitle\tArtist\tSongs\tDownloaded\tDeleted\tFolder\tLink\r\n") ||
+		strings.Count(rec, "\r\n") != 4 || !strings.Contains(rec, "Album\tAlbum 1\tArtist 1\t2\t") ||
+		!strings.Contains(rec, "\t\tArtist 1/2026 - Album 1\t"+f.URL+"/album/a1\r\n") {
+		t.Fatalf("the record:\n%s", rec)
+	}
+	card := r.ask("card")
+	if card.Rows[0].Title != "3 on the card · 0 deleted" || len(card.Rows) != 4 || card.Rows[1].URI != "rec" {
+		t.Fatalf("downloaded:\n%s", rowsOf(card))
+	}
+	if m := r.ask("menu"); !strings.Contains(rowsOf(m), "|card|Downloaded|3 downloads on the card|") {
+		t.Fatalf("menu:\n%s", rowsOf(m))
+	}
+	rp := r.ask("rec", id1)
+	if rp.Rows[0].Kind != "local" || rp.Rows[0].URI != dir1+"/" || rp.Rows[1].URI != "delete" || rp.Rows[1].Context != id1 {
+		t.Fatalf("its page:\n%s", rowsOf(rp))
+	}
+	// the first press asks, the second deletes
+	if rep := r.ask("delete", id1); rep.Message != "Press again to delete “Album 1” from the card" {
+		t.Fatalf("delete once: %+v", rep)
+	}
+	if _, err := os.Stat(dir1); err != nil {
+		t.Fatal("deleted at the first press")
+	}
+	os.Remove(r.tmp + ".library")
+	if rep := r.ask("delete", id1); rep.Message != "Deleted “Album 1” from the card" {
+		t.Fatalf("delete twice: %+v", rep)
+	}
+	if _, err := os.Stat(filepath.Join(r.card, "Bandcamp", "Artist 1")); !os.IsNotExist(err) {
+		t.Fatalf("its folders are still there: %v", err)
+	}
+	if _, err := os.Stat(r.tmp + ".library"); err != nil {
+		t.Fatal("Update Local Music wasn't asked for after the delete")
+	}
+	if rec := record(); !regexp.MustCompile(`Album\tAlbum 1\tArtist 1\t2\t[0-9-]+ [0-9:]+\t[0-9-]+ [0-9:]+\t`).MatchString(rec) {
+		t.Fatalf("the record after the delete:\n%s", rec)
+	}
+	if rp = r.ask("rec", id1); rp.Rows[0].URI != "redo" || !strings.HasPrefix(rp.Rows[0].Subtitle, "Deleted from the card ") {
+		t.Fatalf("its page, deleted:\n%s", rowsOf(rp))
+	}
+	nn := r.ask("nn")
+	if nn.Rows[3].Kind != "action" || nn.Rows[3].URI != "get" || !strings.HasPrefix(nn.Rows[3].Subtitle, "Deleted ") ||
+		!strings.HasSuffix(nn.Rows[3].Subtitle, "press to download again") || nn.Rows[0].Subtitle != "2 on the card · 1 deleted" {
+		t.Fatalf("nn after the delete:\n%s", rowsOf(nn))
+	}
+	// Download the Top N passes over what was deleted
+	pages := f.count("/album/a1")
+	r.ask("setn", "nn:4")
+	if rep := r.ask("top", "nn"); rep.Message != "Downloading 1 album; passed over 2 on the card, 1 deleted before" {
+		t.Fatalf("top 4: %+v", rep)
+	}
+	r.idle()
+	if _, err := os.Stat(dir1); err == nil || f.count("/album/a1") != pages {
+		t.Fatal("the deleted album came back")
+	}
+	if _, err := os.Stat(filepath.Join(r.card, "Bandcamp", "Artist 3", "2026 - Album 3", "01 - One.mp3")); err != nil {
+		t.Fatal(err)
+	}
+	// and what was deleted by hand (File Browser) too
+	os.RemoveAll(filepath.Join(r.card, "Bandcamp", "Artist 2"))
+	if card = r.ask("card"); card.Rows[0].Title != "2 on the card · 2 deleted" {
+		t.Fatalf("downloaded, one deleted by hand:\n%s", rowsOf(card))
+	}
+	if rep := r.ask("top", "nn"); rep.Message != "Nothing new: 2 on the card, 2 deleted before" {
+		t.Fatalf("top after a delete by hand: %+v", rep)
+	}
+	// Play/Pause held twice on an album on the card deletes it
+	row := r.ask("nn").Rows[2]
+	if row.Position != "del:"+id0 {
+		t.Fatalf("a0's row: %+v", row)
+	}
+	if rep := r.ask(row.Position, row.Context); rep.Message != "Hold Play/Pause again to delete “Album 0” from the card" {
+		t.Fatalf("hold once: %+v", rep)
+	}
+	if rep := r.ask(row.Position, row.Context); rep.Message != "Deleted “Album 0” from the card" {
+		t.Fatalf("hold twice: %+v", rep)
+	}
+	// a press on a deleted album's row downloads it again; so does Download Again on its page
+	if rep := r.ask("get", f.URL+"/album/a1"); rep.Message != "Downloading “Album 1”" {
+		t.Fatalf("get a deleted one: %+v", rep)
+	}
+	if rep := r.ask("redo", id0); rep.Message != "Downloading “Album 0” again" {
+		t.Fatalf("redo: %+v", rep)
+	}
+	r.idle()
+	if st, j := r.d.dl.state(key1); st != "done" || !j.Deleted.IsZero() {
+		t.Fatalf("a1 again: %s %+v", st, j)
+	}
+	if st, _ := r.d.dl.state(key0); st != "done" {
+		t.Fatalf("a0 again: %s", st)
+	}
+	// a deleted one asked for again that Bandcamp took down: the record keeps it, deleted, and
+	// Downloads says why
+	f.mu.Lock()
+	f.gone["a2"] = true
+	f.mu.Unlock()
+	key2 := releaseKey(f.URL + "/album/a2")
+	if rep := r.ask("get", f.URL+"/album/a2"); !strings.HasPrefix(rep.Message, "Downloading") {
+		t.Fatalf("get a2: %+v", rep)
+	}
+	r.idle()
+	if st, j := r.d.dl.state(key2); st != "gone" || j.Done != 2 || j.Err != errGone.Error() {
+		t.Fatalf("a2 after a failed try: %s %+v", st, j)
+	}
+	if !strings.Contains(record(), "Album\tAlbum 2\tArtist 2\t2\t") {
+		t.Fatalf("a2 left the record:\n%s", record())
+	}
+	if !strings.Contains(rowsOf(r.ask("downloads")), "|Album 2|Couldn't download: Not on Bandcamp any more · press to try again|") {
+		t.Fatalf("downloads:\n%s", rowsOf(r.ask("downloads")))
+	}
+	if rep := r.ask("top", "nn"); rep.Message != "Nothing new: 3 on the card, 1 deleted before" {
+		t.Fatalf("top after: %+v", rep)
+	}
+	// the record and the settings outlive a restart
+	r.stop()
+	r2 := newRig(t, f, base)
+	if card = r2.ask("card"); card.Rows[0].Title != "3 on the card · 1 deleted" {
+		t.Fatalf("after a restart:\n%s", rowsOf(card))
+	}
+	if r2.ask("nn").Rows[0].Title != "Download the Top 4" {
+		t.Fatal("How Many was forgotten")
+	}
 }
 
 func TestAlbumDetails(t *testing.T) {
@@ -558,8 +723,9 @@ func TestPlaylistAndShowAsAlbums(t *testing.T) {
 	}
 	pl := r.ask("playlist", "77")
 	got := rowsOf(pl)
-	if pl.Rows[0].Title != "Play Playlist" || pl.Rows[0].Context != "playlist:77:0" || pl.Rows[1].URI != "getlist" ||
-		pl.Rows[2].Context != "playlist:77:0" || pl.Rows[2].Position != "getalbum" || pl.Rows[4].Kind != "info" {
+	if pl.Rows[0].URI != "getlist" || pl.Rows[0].Title != "Download Playlist" || pl.Rows[1].Kind != "info" ||
+		pl.Rows[2].URI != "getalbum" || pl.Rows[2].Context != "playlist:77:0" || pl.Rows[2].Position != "" ||
+		!strings.HasPrefix(pl.Rows[4].Subtitle, "Not in this list's download") {
 		t.Fatalf("playlist:\n%s", got)
 	}
 	if rep := r.ask("getlist", "playlist:77"); rep.Message != "Downloading “Night Drive”" {
@@ -581,8 +747,8 @@ func TestPlaylistAndShowAsAlbums(t *testing.T) {
 		t.Fatal("a song Bandcamp doesn't stream was downloaded")
 	}
 	pl = r.ask("playlist", "77")
-	if pl.Rows[1].Kind != "local" || pl.Rows[1].Title != "On the Card" || pl.Rows[2].Title != "Download Again" ||
-		pl.Rows[3].Kind != "local" || pl.Rows[3].URI != filepath.Join(dir, "01 - One.mp3") {
+	if pl.Rows[0].Kind != "local" || pl.Rows[0].Title != "On the Card" || pl.Rows[1].Title != "Download Again" ||
+		pl.Rows[2].URI != "delete" || pl.Rows[4].Kind != "local" || pl.Rows[4].URI != filepath.Join(dir, "01 - One.mp3") {
 		t.Fatalf("playlist after:\n%s", rowsOf(pl))
 	}
 
@@ -595,8 +761,8 @@ func TestPlaylistAndShowAsAlbums(t *testing.T) {
 	}
 	show := r.ask("show", "1018")
 	got = rowsOf(show)
-	if show.Rows[0].Title != "Belfast's jazz-punks." || show.Rows[1].URI != "playshow" || show.Rows[2].Title != "Play the Songs" ||
-		show.Rows[3].Title != "Download the Songs" || show.Rows[5].Subtitle != "3:10 · Artist 5 · Album 5" {
+	if show.Rows[0].Title != "Belfast's jazz-punks." || show.Rows[1].Title != "Download the Songs" || show.Rows[2].Kind != "info" ||
+		show.Rows[4].URI != "getalbum" || show.Rows[4].Subtitle != "3:10 · Artist 5 · Album 5" {
 		t.Fatalf("show:\n%s", got)
 	}
 	r.ask("getlist", "radio:1018")
@@ -610,113 +776,13 @@ func TestPlaylistAndShowAsAlbums(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(dir, ".q2-playlist")); !strings.Contains(string(b), "radio 1018") {
 		t.Fatalf(".q2-playlist: %q", b)
 	}
-	// Play/Pause held on a show's song downloads the release it is on
+	// a press on a show's song downloads the release it is on
 	if rep := r.ask("getalbum", "radio:1018:0"); rep.Message != "Downloading “Album 4”" {
 		t.Fatalf("getalbum: %+v", rep)
 	}
 	r.idle()
 	if _, err := os.Stat(filepath.Join(r.card, "Bandcamp", "Artist 4", "2026 - Album 4", "01 - One.mp3")); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestStreaming(t *testing.T) {
-	f := newFake(t)
-	r := newRig(t, f, "")
-	page := f.URL + "/album/loves-arp"
-	if rep := r.ask("play", page); rep.Message != "Playing “Love's Arp”" {
-		t.Fatalf("play: %+v", rep)
-	}
-	play, _ := os.ReadFile(r.tmp + ".play")
-	if !strings.HasSuffix(string(play), " "+r.tmp+".urls\n") {
-		t.Fatalf(".play: %q", play)
-	}
-	b, _ := os.ReadFile(r.tmp + ".urls")
-	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	if lines[0] != "#Q2URLS/1\tstart=0" || len(lines) != 3 {
-		t.Fatalf(".urls:\n%s", b)
-	}
-	fields := strings.Split(lines[2], "\t")
-	if len(fields) != 6 || fields[1] != "Love's Ekongo" || fields[2] != "Dawuna" || fields[3] != "Love's Arp" ||
-		!strings.HasSuffix(fields[4], "/i/a2440250561.jpg") || fields[5] != "101" {
-		t.Fatalf("a line: %q", fields)
-	}
-	if l, _ := os.ReadFile(filepath.Join(r.tmp+".lyrics", "1.lrc")); string(l) != "first line\nsecond line" {
-		t.Fatalf("lyrics: %q", l)
-	}
-	// the proxy: a Range passed through, plain HTTP
-	req, _ := http.NewRequest("GET", fields[0], nil)
-	req.Header.Set("Range", "bytes=10-19")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 206 || !bytes.Equal(body, audio(502)[10:20]) || resp.Header.Get("Content-Type") != "audio/mpeg" ||
-		!strings.HasPrefix(resp.Header.Get("Content-Range"), "bytes 10-19/") {
-		t.Fatalf("proxied: %d %q %v", resp.StatusCode, body, resp.Header)
-	}
-	resp, err = http.Get(fields[4])
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if !bytes.Equal(body, jpeg) {
-		t.Fatalf("cover: %q", body)
-	}
-	// an address Bandcamp no longer takes is asked for again
-	r.d.st.mu.Lock()
-	r.d.st.streams[502] = streamURL{f.URL + "/stream/gone.mp3", time.Now()}
-	r.d.st.mu.Unlock()
-	resp, err = http.Get(fields[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 200 || !bytes.Equal(body, audio(502)) {
-		t.Fatalf("renewed: %d, %d bytes", resp.StatusCode, len(body))
-	}
-	// a show's broadcast, through Bandcamp's redirect
-	if rep := r.ask("playshow", "1018"); rep.Message != "Playing “Robocobra Quartet”" {
-		t.Fatalf("playshow: %+v", rep)
-	}
-	b, _ = os.ReadFile(r.tmp + ".urls")
-	fields = strings.Split(strings.Split(string(b), "\n")[1], "\t")
-	if !strings.HasSuffix(fields[0], "/b/1018.mp3") || fields[2] != "Bandcamp Selects" || fields[5] != "5347" {
-		t.Fatalf("show line: %q", fields)
-	}
-	resp, err = http.Get(fields[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if !bytes.Equal(body, audio(9999)) {
-		t.Fatalf("broadcast: %d bytes", len(body))
-	}
-	// a playlist from its third song: the one Bandcamp doesn't stream is left out
-	if rep := r.ask("playfrom", "playlist:77:2"); rep.Message != "Playing “One”" {
-		t.Fatalf("playfrom: %+v", rep)
-	}
-	b, _ = os.ReadFile(r.tmp + ".urls")
-	if lines := strings.Split(strings.TrimSpace(string(b)), "\n"); lines[0] != "#Q2URLS/1\tstart=2" || len(lines) != 4 {
-		t.Fatalf("playlist queue:\n%s", b)
-	}
-	// once downloaded, the songs play from the card
-	r.ask("get", page)
-	r.idle()
-	r.ask("play", page)
-	b, _ = os.ReadFile(r.tmp + ".urls")
-	if !strings.Contains(string(b), "\n"+filepath.Join(r.card, "Bandcamp", "Dawuna", "2026 - Love's Arp", "01 - Love.mp3")+"\t") {
-		t.Fatalf("card paths:\n%s", b)
-	}
-	// firmware without URL queues says so
-	os.WriteFile(r.caps, []byte("playlist progress\n"), 0o644)
-	if rep := r.ask("play", page); rep.Status != q2spot.Unsupported {
-		t.Fatalf("without urls: %+v", rep)
 	}
 }
 

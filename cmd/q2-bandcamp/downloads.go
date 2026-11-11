@@ -34,9 +34,10 @@ import (
 // missing. A song that fails for its own reason is tried 3 more times (5, 10, 15 s apart), then left
 // out and named in the job's failures; no network, the card away or full pause the queue instead,
 // with no try used up. Jobs waiting and the one under way are kept in .bandcamp/queue.json; finished
-// ones in .bandcamp/done.json, which is how a list knows an album is on the card. When the queue
-// empties after new songs came, Q2 Pod is asked for Update Local Music (its "library" cap), which it
-// runs once nothing plays.
+// ones in .bandcamp/done.json, the record of everything downloaded (record.go), kept after an album
+// is deleted from the card, which is how a list knows an album is on the card or was. When the
+// queue empties after new songs came, Q2 Pod is asked for Update Local Music (its "library" cap),
+// which it runs once nothing plays.
 
 const (
 	songRetries = 3
@@ -64,6 +65,7 @@ type job struct {
 	Failed   []string  `json:"failed,omitempty"`  // "Title: why"
 	Err      string    `json:"err,omitempty"`     // why the job itself failed
 	Finished time.Time `json:"finished,omitempty"`
+	Deleted  time.Time `json:"deleted,omitempty"` // when its folder left the card (record.go)
 }
 
 // releaseKey is a release page's key: its host and path, so the same album from any list is one.
@@ -141,10 +143,12 @@ func (dl *downloads) saveDone() {
 	if err := q2.WriteFile(dl.dfile, b); err != nil {
 		logf("couldn't save the finished list: %v", err)
 	}
+	dl.writeRecord()
 }
 
 // state is what a key is doing: "" (nothing), "run", "wait", "done" (all of it on the card),
-// "some" (on the card, songs failed), "fail" (the job failed); and its job.
+// "some" (on the card, songs failed), "gone" (downloaded, then deleted from the card), "fail" (the
+// job failed, nothing downloaded); and its job.
 func (dl *downloads) state(key string) (string, *job) {
 	dl.mu.Lock()
 	defer dl.mu.Unlock()
@@ -160,10 +164,13 @@ func (dl *downloads) state(key string) (string, *job) {
 	switch {
 	case j == nil:
 		return "", nil
-	case j.Err != "":
-		return "fail", j
-	case !dl.onCard(j):
+	case j.Done == 0:
+		if j.Err != "" {
+			return "fail", j
+		}
 		return "", nil
+	case !dl.onCard(j):
+		return "gone", j
 	case len(j.Failed) > 0:
 		return "some", j
 	}
@@ -187,14 +194,17 @@ func (dl *downloads) folder(key string) string {
 	return ""
 }
 
-// add queues j: "added", "queued" (it was already), "done" (on the card, nothing missing; again
-// asks anyway, for songs deleted since).
+// add queues j: "added", "queued" (it was already), "done" (on the card) or "gone" (downloaded
+// before and deleted since) unless again: the record keeps a list's Download the Top N (and an
+// artist's Download All) from fetching what was ever downloaded; a press on one row asks again.
 func (dl *downloads) add(j *job, again bool) string {
 	switch s, _ := dl.state(j.Key); {
 	case s == "run" || s == "wait":
 		return "queued"
-	case s == "done" && !again:
+	case (s == "done" || s == "some") && !again:
 		return "done"
+	case s == "gone" && !again:
+		return "gone"
 	}
 	dl.mu.Lock()
 	if old := dl.done[j.Key]; old != nil && old.Dir != "" {
@@ -293,7 +303,7 @@ func (dl *downloads) snap() snapshot {
 	}
 	seen := map[string]bool{}
 	for _, k := range dl.recent {
-		if j := dl.done[k]; j != nil && !seen[k] {
+		if j := dl.done[k]; j != nil && !seen[k] && (j.Done == 0 || j.Err != "" || dl.onCard(j)) {
 			seen[k] = true
 			s.recent = append(s.recent, *j)
 		}
@@ -310,6 +320,7 @@ func (dl *downloads) onCardOrErr(j *job) bool { return j.Err != "" || dl.onCard(
 
 // run downloads the queue until ctx ends.
 func (dl *downloads) run(ctx context.Context) {
+	dl.sweep()
 	for ctx.Err() == nil {
 		dl.mu.Lock()
 		var j *job
@@ -355,7 +366,18 @@ func (dl *downloads) run(ctx context.Context) {
 			} else {
 				j.Err = ""
 			}
-			j.Finished = time.Now()
+			if old := dl.done[j.Key]; old != nil && old.Done > 0 && j.Done == 0 {
+				// a deleted one asked for again that got nothing: the record keeps what it had,
+				// and Downloads says why this try failed
+				keep := *old
+				keep.Err, keep.Failed = j.Err, j.Failed
+				if keep.Err == "" {
+					keep.Err = "none of its songs came"
+				}
+				j = &keep
+			} else {
+				j.Finished, j.Deleted = time.Now(), time.Time{}
+			}
 			dl.done[j.Key] = j
 			dl.recent = append([]string{j.Key}, dl.recent...)
 			if len(dl.recent) > 40 {

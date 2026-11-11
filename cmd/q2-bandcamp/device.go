@@ -25,27 +25,32 @@ import (
 // Play/Pause sends, with its context.
 //
 //	menu                       New and Notable, Album of the Day, Playlists, Bandcamp Radio, Search,
-//	                           Downloads, On the Card, Stop Bandcamp
-//	nn, aotd [cursor]          Download the Top 10 / the Latest 10 (top10 nn|aotd), then the releases
-//	get <page>                 a release downloaded (an album's row; again on one that failed)
-//	play <page>                a release played (Play/Pause held on its row)
+//	                           Downloads, Downloaded, Stop Bandcamp
+//	nn, aotd [cursor]          Download the Top N / the Latest N (top nn|aotd), How Many (topn), then
+//	                           the releases
+//	topn <list>, setn <list>:<n>
+//	                           the How Many page, and its choice
+//	get <page>                 a release downloaded (a press on its row; again on one deleted)
+//	del:<id>                   held twice on a release on the card: deleted from the card
 //	playlists, fan <id>        featured playlists, a fan's: rows open playlist <id>
-//	playlist <id> [cursor]     Play Playlist, Download Playlist (getlist), its songs
+//	playlist <id> [cursor]     Download Playlist (getlist), its songs: a press downloads the
+//	                           release a song is on (getalbum)
 //	radio                      Latest Shows and each series (series <name>), then show <id>
-//	show <id> [cursor]         Play the Show (playshow: the broadcast), Play the Songs, Download the
-//	                           Songs (getlist), the songs
-//	playfrom <kind>:<id>:<n>   a playlist's or show's songs played from the n'th
-//	getalbum <kind>:<id>:<n>   the release a playlist's or show's song is on, downloaded (held)
+//	show <id> [cursor]         Download the Songs (getlist), the songs (getalbum)
 //	search <text>              releases, artists and labels (artist <url>), fans (fan <id>)
 //	artist <url> [cursor]      Download All (getall), then its releases
 //	downloads [cursor]         the queue, finished jobs, failures (retry), cancel, cancelall, forget
-//	card [cursor]              everything downloaded, the newest first
+//	card [cursor]              Downloaded: the record, the newest first; rec <id> one of it, with
+//	                           delete <id> (twice) or redo <id>
 //	stop                       the app stops
 //
 // A list whose rows show a download under way says "refresh" and is asked again every 2 s while on
 // top. Lists come from Bandcamp through the cache (cache.go).
 
 const perPage = 48 // a page's rows, past a Previous and a Next row (Q2SPOT/1 sends 50 at most)
+
+// deleteWithin is how soon a delete's second press must come.
+const deleteWithin = 5 * time.Second
 
 type item struct {
 	row q2spot.Row
@@ -61,8 +66,6 @@ func fail(err error) q2spot.Reply {
 	switch {
 	case errors.Is(err, errLoading):
 		return q2spot.Reply{Message: "refresh", Rows: []q2spot.Row{info("Loading…", "Bandcamp is sending a long list")}}
-	case errors.Is(err, errNoURLs):
-		return q2spot.Fail(q2spot.Unsupported, err.Error())
 	case errors.Is(err, bandcamp.ErrNotFound):
 		return q2spot.Fail(q2spot.Unavailable, "It isn't on Bandcamp any more")
 	case errors.Is(err, bandcamp.ErrBlocked):
@@ -73,7 +76,7 @@ func fail(err error) q2spot.Reply {
 	return q2spot.Fail(q2spot.Error, "Bandcamp didn't answer")
 }
 
-// device answers the Q2's page; a slow answer (the Q2 waits 15 s) is logged.
+// device answers the Q2's page; a slow answer (the Q2 waits 15 s) or a failure is logged.
 func (d *daemon) device(req q2spot.Request) q2spot.Reply {
 	t := time.Now()
 	r := d.answer(req)
@@ -83,13 +86,16 @@ func (d *daemon) device(req q2spot.Request) q2spot.Reply {
 	return r
 }
 
-var ops = []string{"caps", "menu", "nn", "aotd", "top10", "get", "getall", "play", "playlists", "fan", "playlist",
-	"radio", "series", "show", "playfrom", "playshow", "getlist", "getalbum", "search", "artist", "downloads",
-	"cancel", "cancelall", "retry", "forget", "card", "stop"}
+var ops = []string{"caps", "menu", "nn", "aotd", "top", "topn", "setn", "get", "getall", "playlists", "fan", "playlist",
+	"radio", "series", "show", "getlist", "getalbum", "search", "artist", "downloads", "cancel", "cancelall", "retry",
+	"forget", "card", "rec", "delete", "redo", "stop"}
 
 func (d *daemon) answer(req q2spot.Request) q2spot.Reply {
 	d.touch()
 	a0, a1 := req.Arg(0), req.Arg(1)
+	if id, ok := strings.CutPrefix(req.Op, "del:"); ok { // Play/Pause held on a release on the card
+		return d.deleteRec(id, "Hold Play/Pause again")
+	}
 	switch req.Op {
 	case "caps":
 		var rows []q2spot.Row
@@ -101,14 +107,16 @@ func (d *daemon) answer(req q2spot.Request) q2spot.Reply {
 		return d.menu()
 	case "nn", "aotd":
 		return d.picks(req.Op, a0)
-	case "top10":
-		return d.top10(a0)
+	case "top":
+		return d.top(a0)
+	case "topn":
+		return d.topPage(a0)
+	case "setn":
+		return d.setTop(a0)
 	case "get":
 		return d.getRelease(a0)
 	case "getall":
 		return d.getAll(a0)
-	case "play":
-		return d.playRelease(a0)
 	case "playlists":
 		return d.featured(a0)
 	case "fan":
@@ -121,10 +129,6 @@ func (d *daemon) answer(req q2spot.Request) q2spot.Reply {
 		return d.radio()
 	case "series":
 		return d.series(a0, a1)
-	case "playfrom":
-		return d.playFrom(a0)
-	case "playshow":
-		return d.playShow(a0)
 	case "getlist":
 		return d.getList(a0)
 	case "getalbum":
@@ -136,7 +140,13 @@ func (d *daemon) answer(req q2spot.Request) q2spot.Reply {
 	case "downloads":
 		return d.downloadsPage(a0)
 	case "card":
-		return d.cardPage(a0)
+		return d.recordPage(a0)
+	case "rec":
+		return d.recPage(a0)
+	case "delete":
+		return d.deleteRec(a0, "Press again")
+	case "redo":
+		return d.redo(a0)
 	case "cancel":
 		if !d.dl.remove(a0) {
 			return q2spot.Fail(q2spot.Unavailable, "It isn't waiting any more")
@@ -226,11 +236,31 @@ func (d *daemon) menu() q2spot.Reply {
 	if len(s.queue) > 0 || len(s.recent) > 0 {
 		rows = append(rows, q2spot.Row{Kind: "list", URI: "downloads", Title: "Downloads", Subtitle: queueLine(s)})
 	}
-	if d.dl.anyOnCard() {
-		rows = append(rows, q2spot.Row{Kind: "list", URI: "card", Title: "On the Card", Subtitle: "What you downloaded, in Bandcamp/"})
+	if on, gone := d.dl.counts(); on+gone > 0 {
+		sub := plural(on, "download") + " on the card"
+		if gone > 0 {
+			sub += fmt.Sprintf(" · %d deleted", gone)
+		}
+		rows = append(rows, q2spot.Row{Kind: "list", URI: "card", Title: "Downloaded", Subtitle: sub})
 	}
 	rows = append(rows, q2spot.Row{Kind: "action", URI: "stop", Title: "Stop Bandcamp", Subtitle: "Downloads go on at its next start"})
 	return q2spot.Reply{Message: liveMsg(len(s.queue) > 0), Rows: rows}
+}
+
+// counts is how many of the record are on the card, and how many were deleted.
+func (dl *downloads) counts() (on, gone int) {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
+	for _, j := range dl.done {
+		switch {
+		case j.Done == 0:
+		case dl.onCard(j):
+			on++
+		default:
+			gone++
+		}
+	}
+	return on, gone
 }
 
 // queueLine is the Downloads row's subtitle: what is under way.
@@ -285,28 +315,30 @@ func (d *daemon) status(key string) (string, bool) {
 		return fmt.Sprintf("%d of %d on the card", j.Done, j.Total), false
 	case "done":
 		return "On the card", false
+	case "gone":
+		return "Deleted " + day(j.Deleted), false
 	}
 	return "", false
 }
 
-// albumItem is a release's row: on the card, a local row (a press plays it); else a press
-// downloads it and Play/Pause held plays it.
+// albumItem is a release's row: on the card, a local row (a press plays it, Play/Pause held twice
+// deletes it); else a press downloads it (again, after it was deleted).
 func (d *daemon) albumItem(a bandcamp.Album, sub string) (item, bool) {
 	key := releaseKey(a.URL)
 	pic := bandcamp.Pic{ID: a.Art, Art: true}
 	if dir := d.dl.folder(key); dir != "" {
 		st, _ := d.status(key)
 		return item{q2spot.Row{Kind: "local", URI: dir + "/", Context: "album", Title: a.Title,
-			Subtitle: joinNonEmpty(" · ", st, a.Artist)}, pic}, false
+			Subtitle: joinNonEmpty(" · ", st, a.Artist), Position: "del:" + recID(key)}, pic}, false
 	}
 	st, live := d.status(key)
 	if st != "" {
 		sub = joinNonEmpty(" · ", st, a.Artist)
-		if strings.HasPrefix(st, "Couldn't") {
-			sub += " · press to try again"
+		if strings.HasPrefix(st, "Couldn't") || strings.HasPrefix(st, "Deleted") {
+			sub += " · press to download again"
 		}
 	}
-	return item{q2spot.Row{Kind: "action", URI: "get", Context: a.URL, Title: a.Title, Subtitle: sub, Position: "play"}, pic}, live
+	return item{q2spot.Row{Kind: "action", URI: "get", Context: a.URL, Title: a.Title, Subtitle: sub}, pic}, live
 }
 
 func (d *daemon) albumItems(as []bandcamp.Album, sub func(bandcamp.Album) string) ([]item, bool) {
@@ -345,8 +377,8 @@ func (d *daemon) picks(which, cursor string) q2spot.Reply {
 		sub = func(a bandcamp.Album) string { return joinNonEmpty(" · ", a.Artist, day(a.Date)) }
 	}
 	items, live := d.albumItems(as, sub)
-	head, hlive := d.top10Row(which, as)
-	return d.window([]item{head}, items, cursor, liveMsg(live || hlive))
+	head, hlive := d.topRows(which, as)
+	return d.window(head, items, cursor, liveMsg(live || hlive))
 }
 
 func day(t time.Time) string {
@@ -359,35 +391,65 @@ func day(t time.Time) string {
 	return t.Format("2 Jan")
 }
 
-// top10Row is Download the Top 10 (New and Notable) or the Latest 10 (Album of the Day), saying how
-// many of those are on the card or coming.
-func (d *daemon) top10Row(which string, as []bandcamp.Album) (item, bool) {
-	title, sub := "Download the Top 10", "The editors' 10 newest picks"
+// topTitle is a list's download row: Download the Top N (New and Notable), the Latest N (Album of
+// the Day).
+func topTitle(which string, n int) string {
 	if which == "aotd" {
-		title, sub = "Download the Latest 10", "The 10 latest Albums of the Day"
+		return fmt.Sprintf("Download the Latest %d", n)
 	}
-	have, coming := 0, 0
-	for _, a := range as[:min(10, len(as))] {
+	return fmt.Sprintf("Download the Top %d", n)
+}
+
+// topRows are a list's Download the Top N, saying what of those N is on the card, deleted or
+// coming, and How Many.
+func (d *daemon) topRows(which string, as []bandcamp.Album) ([]item, bool) {
+	n := d.set.top(which)
+	sub := fmt.Sprintf("The editors' %d newest picks", n)
+	if which == "aotd" {
+		sub = fmt.Sprintf("The %d latest Albums of the Day", n)
+	}
+	have, gone, coming := 0, 0, 0
+	top := as[:min(n, len(as))]
+	for _, a := range top {
 		switch st, _ := d.dl.state(releaseKey(a.URL)); st {
 		case "done", "some":
 			have++
+		case "gone":
+			gone++
 		case "run", "wait":
 			coming++
 		}
 	}
-	switch {
-	case have == min(10, len(as)) && have > 0:
-		sub = "All of them are on the card"
-	case coming > 0:
-		sub = fmt.Sprintf("%d on the card · %d downloading", have, coming)
-	case have > 0:
-		sub = fmt.Sprintf("%d of them on the card · press for the rest", have)
+	if have+gone+coming > 0 {
+		var parts []string
+		if have > 0 {
+			parts = append(parts, fmt.Sprintf("%d on the card", have))
+		}
+		if gone > 0 {
+			parts = append(parts, fmt.Sprintf("%d deleted", gone))
+		}
+		if coming > 0 {
+			parts = append(parts, fmt.Sprintf("%d downloading", coming))
+		}
+		if left := len(top) - have - gone - coming; left > 0 {
+			parts = append(parts, fmt.Sprintf("%d new", left))
+		}
+		sub = strings.Join(parts, " · ")
 	}
-	return item{row: q2spot.Row{Kind: "action", URI: "top10", Context: which, Title: title, Subtitle: sub}}, coming > 0
+	what := "picks"
+	if which == "aotd" {
+		what = "albums"
+	}
+	return []item{
+		{row: q2spot.Row{Kind: "action", URI: "top", Context: which, Title: topTitle(which, n), Subtitle: sub}},
+		{row: q2spot.Row{Kind: "list", URI: "topn", Context: which, Title: fmt.Sprintf("How Many: %d", n),
+			Subtitle: "How many of the newest " + what + " it downloads"}},
+	}, coming > 0
 }
 
-// top10 queues the list's first 10 releases as they are now, those not on the card.
-func (d *daemon) top10(which string) q2spot.Reply {
+// top queues the list's first N releases as they are now, those never downloaded: one on the card,
+// or downloaded and deleted since, is passed over.
+func (d *daemon) top(which string) q2spot.Reply {
 	if which != "nn" && which != "aotd" {
 		return q2spot.Fail(q2spot.Bad, "Which list?")
 	}
@@ -396,26 +458,71 @@ func (d *daemon) top10(which string) q2spot.Reply {
 		return fail(err)
 	}
 	d.remember(as)
-	added, had, queued := 0, 0, 0
-	for _, a := range as[:min(10, len(as))] {
+	n := d.set.top(which)
+	added, have, gone, queued := 0, 0, 0, 0
+	for _, a := range as[:min(n, len(as))] {
 		switch d.dl.add(albumJob(a), false) {
 		case "added":
 			added++
 		case "done":
-			had++
+			have++
+		case "gone":
+			gone++
 		default:
 			queued++
 		}
 	}
-	switch {
-	case added == 0 && had > 0 && queued == 0:
-		return okMsg("All 10 are on the card already")
-	case added == 0:
-		return okMsg("They're in Downloads already")
-	case had > 0:
-		return okMsg(fmt.Sprintf("Downloading %s; %d on the card already", plural(added, "album"), had))
+	var before []string
+	if have > 0 {
+		before = append(before, fmt.Sprintf("%d on the card", have))
 	}
-	return okMsg("Downloading " + plural(added, "album"))
+	if gone > 0 {
+		before = append(before, fmt.Sprintf("%d deleted before", gone))
+	}
+	if queued > 0 {
+		before = append(before, fmt.Sprintf("%d in Downloads", queued))
+	}
+	if added == 0 {
+		return okMsg("Nothing new: " + strings.Join(before, ", "))
+	}
+	msg := "Downloading " + plural(added, "album")
+	if len(before) > 0 {
+		msg += "; passed over " + strings.Join(before, ", ")
+	}
+	return okMsg(msg)
+}
+
+// topPage is How Many: the Ns to choose from, the list's own marked.
+func (d *daemon) topPage(which string) q2spot.Reply {
+	if which != "nn" && which != "aotd" {
+		return q2spot.Fail(q2spot.Bad, "Which list?")
+	}
+	cur := d.set.top(which)
+	var rows []q2spot.Row
+	for _, n := range topChoices {
+		sub := ""
+		if n == cur {
+			sub = "Chosen"
+		}
+		if n == defaultTop {
+			sub = joinNonEmpty(" · ", sub, "The first choice")
+		}
+		rows = append(rows, q2spot.Row{Kind: "action", URI: "setn", Context: which + ":" + strconv.Itoa(n),
+			Title: strings.TrimPrefix(topTitle(which, n), "Download the "), Subtitle: sub})
+	}
+	return q2spot.Reply{Rows: rows}
+}
+
+func (d *daemon) setTop(arg string) q2spot.Reply {
+	which, num, _ := strings.Cut(arg, ":")
+	n, err := strconv.Atoi(num)
+	if (which != "nn" && which != "aotd") || err != nil || n < 1 || n > 120 {
+		return q2spot.Fail(q2spot.Bad, "How many?")
+	}
+	if err := d.set.setTop(which, n); err != nil {
+		return q2spot.Fail(q2spot.Error, "Couldn't save the setting")
+	}
+	return okMsg(topTitle(which, n))
 }
 
 func albumJob(a bandcamp.Album) *job {
@@ -427,7 +534,7 @@ func albumJob(a bandcamp.Album) *job {
 		Pic: bandcamp.Pic{ID: a.Art, Art: true}.Key()}
 }
 
-// getRelease downloads a release (a press on its row), or tries a failed one again.
+// getRelease downloads a release (a press on its row): again after it failed or was deleted.
 func (d *daemon) getRelease(page string) q2spot.Reply {
 	if !strings.HasPrefix(page, "http") {
 		return q2spot.Fail(q2spot.Bad, "Which release?")
@@ -437,7 +544,7 @@ func (d *daemon) getRelease(page string) q2spot.Reply {
 		a = bandcamp.Album{URL: page}
 	}
 	st, _ := d.dl.state(releaseKey(page))
-	switch d.dl.add(albumJob(a), st == "fail" || st == "some") {
+	switch d.dl.add(albumJob(a), st == "fail" || st == "some" || st == "gone") {
 	case "queued":
 		s, _ := d.status(releaseKey(page))
 		return okMsg(s)
@@ -450,33 +557,7 @@ func (d *daemon) getRelease(page string) q2spot.Reply {
 	return okMsg("Downloading “" + a.Title + "”")
 }
 
-// release is a release's page as Bandcamp has it, for playing it.
-func (d *daemon) release(page string) (*bandcamp.Release, error) {
-	v, err := d.cache.get("release:"+releaseKey(page), 10*time.Minute, false, func(ctx context.Context) (any, error) {
-		return d.bc.Release(ctx, page)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return v.(*bandcamp.Release), nil
-}
-
-// playRelease plays a release (Play/Pause held on its row): from the card where it is there.
-func (d *daemon) playRelease(page string) q2spot.Reply {
-	if !q2.HasCap("urls") {
-		return fail(errNoURLs)
-	}
-	r, err := d.release(page)
-	if err != nil {
-		return fail(err)
-	}
-	if err := d.st.start(d.st.releaseEntries(r, d.dl.folder(releaseKey(page))), 0); err != nil {
-		return fail(err)
-	}
-	return okMsg("Playing “" + r.Title + "”")
-}
-
-// cachedList is a playlist's, a show's or a release's songs from Bandcamp's player.
+// cachedList is a playlist's or a show's songs from Bandcamp's player.
 func (d *daemon) cachedList(ctx context.Context, kind string, id int64) (*bandcamp.Tracklist, error) {
 	v, err := d.cache.get("list:"+listKey(kind, id), 10*time.Minute, false, func(ctx context.Context) (any, error) {
 		return d.bc.Tracklist(ctx, kind, id)
@@ -548,7 +629,8 @@ func parseList(s string) (kind string, id int64, n int, ok bool) {
 	return parts[0], id, n, true
 }
 
-// listPage is a playlist's or a radio show's page: playing it, downloading it, its songs.
+// listPage is a playlist's or a radio show's page: downloading it, then its songs; a press on a
+// song downloads the release it is on.
 func (d *daemon) listPage(kind, arg, cursor string) q2spot.Reply {
 	id, err := strconv.ParseInt(arg, 10, 64)
 	if err != nil {
@@ -561,31 +643,15 @@ func (d *daemon) listPage(kind, arg, cursor string) q2spot.Reply {
 		return fail(err)
 	}
 	ref := listKey(kind, id)
-	streams := 0
-	for _, t := range tl.Tracks {
-		if t.Stream != "" {
-			streams++
-		}
-	}
 	var head []item
 	if kind == "radio" {
 		if s, ok := d.showInfo(id); ok && s.Blurb != "" {
-			head = append(head, item{row: info(s.Blurb, day(s.Date))})
+			head = append(head, item{row: info(s.Blurb, day(s.Date)), pic: tl.Image})
 		}
-		head = append(head, item{row: q2spot.Row{Kind: "action", URI: "playshow", Context: arg, Title: "Play the Show",
-			Subtitle: "The broadcast as it aired · " + clock(tl.Seconds)}, pic: tl.Image})
-		head = append(head, item{row: q2spot.Row{Kind: "action", URI: "playfrom", Context: ref + ":0", Title: "Play the Songs",
-			Subtitle: plural(streams, "song") + ", without the talk"}})
-	} else {
-		secs := 0.0
-		for _, t := range tl.Tracks {
-			secs += t.Seconds
-		}
-		head = append(head, item{row: q2spot.Row{Kind: "action", URI: "playfrom", Context: ref + ":0", Title: "Play Playlist",
-			Subtitle: joinNonEmpty(" · ", plural(streams, "song"), clock(secs), tl.Artist)}, pic: tl.Image})
 	}
-	dl, live := d.listDownloadRow(kind, ref, tl)
+	dl, live := d.listDownloadRows(kind, ref, tl)
 	head = append(head, dl...)
+	head = append(head, item{row: info("Press a song to download its album", "")})
 	dir := d.dl.folder(ref)
 	items := make([]item, 0, len(tl.Tracks))
 	for i, t := range tl.Tracks {
@@ -594,26 +660,24 @@ func (d *daemon) listPage(kind, arg, cursor string) q2spot.Reply {
 			sub = joinNonEmpty(" · ", clock(t.At), sub)
 		}
 		pic := bandcamp.Pic{ID: t.Art, Art: true}
-		if t.Stream == "" {
-			items = append(items, item{info(t.Title, joinNonEmpty(" · ", "Bandcamp doesn't stream it", t.Artist)), pic})
-			continue
-		}
-		ctxArg := ref + ":" + strconv.Itoa(i)
 		if dir != "" {
 			if p := filepath.Join(dir, songFile(i+1, len(tl.Tracks), t.Title)); exists(p) {
 				items = append(items, item{q2spot.Row{Kind: "local", URI: p, Context: "album", Title: t.Title, Subtitle: sub}, pic})
 				continue
 			}
 		}
-		items = append(items, item{q2spot.Row{Kind: "action", URI: "playfrom", Context: ctxArg, Title: t.Title, Subtitle: sub,
-			Position: "getalbum"}, pic})
+		if t.Stream == "" {
+			sub = joinNonEmpty(" · ", "Not in this list's download", sub)
+		}
+		items = append(items, item{q2spot.Row{Kind: "action", URI: "getalbum", Context: ref + ":" + strconv.Itoa(i), Title: t.Title,
+			Subtitle: sub}, pic})
 	}
 	return d.window(head, items, cursor, liveMsg(live))
 }
 
-// listDownloadRow is a list's download row(s): on the card, its folder; else Download, with its
-// state.
-func (d *daemon) listDownloadRow(kind, ref string, tl *bandcamp.Tracklist) ([]item, bool) {
+// listDownloadRows are a list's download rows: on the card, its folder, Download Again and Delete;
+// else Download, with its state.
+func (d *daemon) listDownloadRows(kind, ref string, tl *bandcamp.Tracklist) ([]item, bool) {
 	title, where := "Download Playlist", "As an album, in Bandcamp/Playlists/"
 	if kind == "radio" {
 		title, where = "Download the Songs", "As an album, in Bandcamp/Radio/"
@@ -625,16 +689,18 @@ func (d *daemon) listDownloadRow(kind, ref string, tl *bandcamp.Tracklist) ([]it
 				strings.TrimPrefix(dir, filepath.Dir(d.root)+"/"))}, pic: tl.Image},
 			{row: q2spot.Row{Kind: "action", URI: "getlist", Context: ref, Title: "Download Again",
 				Subtitle: "Fetches the songs that aren't on the card"}},
+			{row: q2spot.Row{Kind: "action", URI: "delete", Context: recID(ref), Title: "Delete from the Card",
+				Subtitle: "Press twice · it stays in Downloaded"}},
 		}, live
 	}
 	sub := where
 	if st != "" {
 		sub = st
-		if strings.HasPrefix(st, "Couldn't") {
-			sub += " · press to try again"
+		if strings.HasPrefix(st, "Couldn't") || strings.HasPrefix(st, "Deleted") {
+			sub += " · press to download again"
 		}
 	}
-	return []item{{row: q2spot.Row{Kind: "action", URI: "getlist", Context: ref, Title: title, Subtitle: sub}}}, live
+	return []item{{row: q2spot.Row{Kind: "action", URI: "getlist", Context: ref, Title: title, Subtitle: sub}, pic: tl.Image}}, live
 }
 
 // showInfo is a show as Bandcamp Radio's list has it, if that was fetched (never waited for).
@@ -651,62 +717,6 @@ func (d *daemon) showInfo(id int64) (bandcamp.Show, bool) {
 	return bandcamp.Show{}, false
 }
 
-// playFrom plays a playlist's or a show's songs from the n'th.
-func (d *daemon) playFrom(arg string) q2spot.Reply {
-	kind, id, n, ok := parseList(arg)
-	if !ok {
-		return q2spot.Fail(q2spot.Bad, "Which list?")
-	}
-	if !q2.HasCap("urls") {
-		return fail(errNoURLs)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	tl, err := d.cachedList(ctx, kind, id)
-	if err != nil {
-		return fail(err)
-	}
-	es, at := d.st.listEntries(tl, d.dl.folder(listKey(kind, id)))
-	from := 0
-	for i := n; i < len(at); i++ {
-		if at[i] >= 0 {
-			from = at[i]
-			break
-		}
-	}
-	if err := d.st.start(es, from); err != nil {
-		return fail(err)
-	}
-	return okMsg("Playing “" + es[from].title + "”")
-}
-
-// playShow plays a radio show's broadcast, talk and all.
-func (d *daemon) playShow(arg string) q2spot.Reply {
-	id, err := strconv.ParseInt(arg, 10, 64)
-	if err != nil {
-		return q2spot.Fail(q2spot.Bad, "Which show?")
-	}
-	if !q2.HasCap("urls") {
-		return fail(errNoURLs)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	tl, err := d.cachedList(ctx, "radio", id)
-	if err != nil {
-		return fail(err)
-	}
-	if tl.Stream == "" {
-		return q2spot.Fail(q2spot.Unavailable, "Bandcamp has no broadcast of this show")
-	}
-	series := cmpOr(bandcamp.Series(tl.Subtitle), "Bandcamp Radio")
-	e := entry{url: d.st.showURL(id), title: joinNonEmpty(" · ", tl.Title, day(tl.Date)), artist: series,
-		album: "Bandcamp Radio", pic: tl.Image, secs: tl.Seconds}
-	if err := d.st.start([]entry{e}, 0); err != nil {
-		return fail(err)
-	}
-	return okMsg("Playing “" + tl.Title + "”")
-}
-
 // getList downloads a playlist or a show's songs, as an album; again, the songs not on the card.
 func (d *daemon) getList(arg string) q2spot.Reply {
 	kind, id, _, ok := parseList(arg)
@@ -720,7 +730,7 @@ func (d *daemon) getList(arg string) q2spot.Reply {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if tl, err := d.cachedList(ctx, kind, id); err == nil {
-		j.Title, j.Artist, j.Pic = tl.Title, tl.Artist, tl.Image.Key()
+		j.Title, j.Artist, j.Pic, j.URL = tl.Title, tl.Artist, tl.Image.Key(), tl.URL
 		if kind == "radio" {
 			j.Artist = bandcamp.Series(tl.Subtitle)
 			j.Title = joinNonEmpty(": ", j.Artist, tl.Title)
@@ -733,7 +743,7 @@ func (d *daemon) getList(arg string) q2spot.Reply {
 	return okMsg("Downloading “" + j.Title + "”")
 }
 
-// getSongAlbum downloads the release a playlist's or a show's song is on (Play/Pause held on it).
+// getSongAlbum downloads the release a playlist's or a show's song is on (a press on the song).
 func (d *daemon) getSongAlbum(arg string) q2spot.Reply {
 	kind, id, n, ok := parseList(arg)
 	if !ok {
@@ -904,7 +914,7 @@ func (d *daemon) search(text string) q2spot.Reply {
 	return d.window(nil, items, "", liveMsg(live))
 }
 
-// artist is an artist's or a label's releases, as their music page lists them.
+// discography is an artist's or a label's releases, as their music page lists them.
 func (d *daemon) discography(root string) ([]bandcamp.Album, error) {
 	v, err := d.cache.get("artist:"+strings.ToLower(root), 30*time.Minute, false, func(ctx context.Context) (any, error) {
 		return d.bc.Discography(ctx, root)
@@ -933,28 +943,26 @@ func (d *daemon) artist(root, cursor string) q2spot.Reply {
 		return a.Artist
 	})
 	head := []item{{row: q2spot.Row{Kind: "action", URI: "getall", Context: root, Title: "Download All",
-		Subtitle: plural(len(as), "release") + ", those not on the card"}}}
+		Subtitle: plural(len(as), "release") + ", those never downloaded"}}}
 	return d.window(head, items, cursor, liveMsg(live))
 }
 
-// getAll downloads every release an artist's page lists (bandcamp-dl's --artist).
+// getAll downloads every release an artist's page lists (bandcamp-dl's --artist), those never
+// downloaded.
 func (d *daemon) getAll(root string) q2spot.Reply {
 	as, err := d.discography(root)
 	if err != nil {
 		return fail(err)
 	}
 	d.remember(as)
-	added, had := 0, 0
+	added := 0
 	for _, a := range as {
-		switch d.dl.add(albumJob(a), false) {
-		case "added":
+		if d.dl.add(albumJob(a), false) == "added" {
 			added++
-		case "done":
-			had++
 		}
 	}
 	if added == 0 {
-		return okMsg("They're on the card or in Downloads already")
+		return okMsg("Nothing new: each was downloaded before, or is in Downloads")
 	}
 	return okMsg("Downloading " + plural(added, "release"))
 }
@@ -967,12 +975,16 @@ func (d *daemon) retry(key string) q2spot.Reply {
 	if old == nil {
 		return q2spot.Fail(q2spot.Unavailable, "It isn't in Downloads any more")
 	}
-	j := &job{Key: old.Key, Kind: old.Kind, URL: old.URL, ID: old.ID, Title: old.Title, Artist: old.Artist, Genre: old.Genre,
-		Pic: old.Pic}
-	if d.dl.add(j, true) == "queued" {
+	if d.dl.add(again(old), true) == "queued" {
 		return okMsg("It's in Downloads already")
 	}
 	return okMsg("Trying again")
+}
+
+// again is a new job for a record's release or list.
+func again(old *job) *job {
+	return &job{Key: old.Key, Kind: old.Kind, URL: old.URL, ID: old.ID, Title: old.Title, Artist: old.Artist, Genre: old.Genre,
+		Pic: old.Pic}
 }
 
 func jobPic(j job) bandcamp.Pic {
@@ -1034,12 +1046,12 @@ func (d *daemon) downloadsPage(cursor string) q2spot.Reply {
 				sub += fmt.Sprintf(" · %d Bandcamp doesn't stream", j.Missing)
 			}
 			items = append(items, item{q2spot.Row{Kind: "local", URI: filepath.Join(d.root, j.Dir) + "/", Context: "album",
-				Title: j.Title, Subtitle: joinNonEmpty(" · ", j.Artist, sub)}, jobPic(j)})
+				Title: j.Title, Subtitle: joinNonEmpty(" · ", j.Artist, sub), Position: "del:" + recID(j.Key)}, jobPic(j)})
 		}
 	}
 	if clean > 0 {
 		items = append(items, item{row: q2spot.Row{Kind: "action", URI: "forget", Title: "Clear Finished",
-			Subtitle: "From this list; they stay on the card"}})
+			Subtitle: "From this list; they stay on the card and in Downloaded"}})
 	}
 	if len(items) == 0 {
 		items = append(items, item{row: info("Nothing to download", "Press an album to download it")})
@@ -1047,43 +1059,110 @@ func (d *daemon) downloadsPage(cursor string) q2spot.Reply {
 	return d.window(nil, items, cursor, "refresh")
 }
 
-// anyOnCard is whether a finished job's folder is on the card.
-func (dl *downloads) anyOnCard() bool {
-	dl.mu.Lock()
-	defer dl.mu.Unlock()
-	for _, j := range dl.done {
-		if j.Err == "" && dl.onCard(j) {
-			return true
-		}
-	}
-	return false
-}
-
-// cardPage is everything downloaded that is still on the card, the newest first.
-func (d *daemon) cardPage(cursor string) q2spot.Reply {
+// recordPage is Downloaded: the record, every release, playlist and show downloaded, the newest
+// first, on the card or deleted since; a row opens its own page (recPage).
+func (d *daemon) recordPage(cursor string) q2spot.Reply {
+	d.dl.sweep()
 	d.dl.mu.Lock()
 	var js []job
-	for _, j := range d.dl.done {
-		if j.Err == "" && d.dl.onCard(j) {
+	on := map[string]bool{}
+	for k, j := range d.dl.done {
+		if j.Done > 0 {
 			js = append(js, *j)
+			on[k] = d.dl.onCard(j)
 		}
 	}
 	d.dl.mu.Unlock()
 	sort.Slice(js, func(i, k int) bool { return js[i].Finished.After(js[k].Finished) })
+	gone := 0
 	var items []item
 	for _, j := range js {
-		what := "Album"
-		switch j.Kind {
-		case "playlist":
-			what = "Playlist"
-		case "radio":
-			what = "Radio show"
+		sub := joinNonEmpty(" · ", kindName(j.Kind), j.Artist, plural(j.Done, "song"), day(j.Finished))
+		if !on[j.Key] {
+			gone++
+			sub = joinNonEmpty(" · ", "Deleted "+day(j.Deleted), kindName(j.Kind), j.Artist)
 		}
-		items = append(items, item{q2spot.Row{Kind: "local", URI: filepath.Join(d.root, j.Dir) + "/", Context: "album",
-			Title: j.Title, Subtitle: joinNonEmpty(" · ", what, j.Artist, plural(j.Done, "song"))}, jobPic(j)})
+		items = append(items, item{q2spot.Row{Kind: "list", URI: "rec", Context: recID(j.Key), Title: j.Title, Subtitle: sub},
+			jobPic(j)})
 	}
 	if len(items) == 0 {
-		items = append(items, item{row: info("Nothing downloaded yet", "Press an album to download it")})
+		return q2spot.Reply{Rows: []q2spot.Row{info("Nothing downloaded yet", "Press an album to download it")}}
 	}
-	return d.window(nil, items, cursor, "")
+	head := []item{{row: info(fmt.Sprintf("%d on the card · %d deleted", len(js)-gone, gone),
+		"The record is in Bandcamp/"+recordName)}}
+	return d.window(head, items, cursor, "")
+}
+
+// recPage is one download of the record: its songs and Delete from the Card while it is there;
+// Download Again once deleted.
+func (d *daemon) recPage(id string) q2spot.Reply {
+	j, ok := d.dl.byID(id)
+	if !ok {
+		return q2spot.Fail(q2spot.Unavailable, "It isn't in the record")
+	}
+	pic := jobPic(*j)
+	st, _ := d.dl.state(j.Key)
+	line, live := d.status(j.Key)
+	var items []item
+	switch {
+	case live:
+		items = append(items, item{info(line, j.Title), pic})
+	case st == "done" || st == "some":
+		items = append(items,
+			item{q2spot.Row{Kind: "local", URI: filepath.Join(d.root, j.Dir) + "/", Context: "album", Title: "Songs",
+				Subtitle: joinNonEmpty(" · ", plural(j.Done, "song"), "Bandcamp/"+filepath.ToSlash(j.Dir))}, pic},
+			item{row: q2spot.Row{Kind: "action", URI: "delete", Context: id, Title: "Delete from the Card",
+				Subtitle: "Press twice · it stays in Downloaded, and Download the Top N passes it over"}})
+		if st == "some" {
+			items = append(items, item{row: q2spot.Row{Kind: "action", URI: "retry", Context: j.Key, Title: "Try the Failed Songs Again",
+				Subtitle: plural(len(j.Failed), "song") + " failed: " + j.Failed[0]}})
+		}
+	default:
+		items = append(items, item{q2spot.Row{Kind: "action", URI: "redo", Context: id, Title: "Download Again",
+			Subtitle: "Deleted from the card " + day(j.Deleted)}, pic})
+	}
+	items = append(items, item{row: info(joinNonEmpty(" · ", kindName(j.Kind), j.Artist),
+		joinNonEmpty(" · ", "Downloaded "+day(j.Finished), plural(j.Done, "song")))})
+	return d.window(nil, items, "", liveMsg(live))
+}
+
+// deleteRec deletes a download from the card at its second ask within deleteWithin; the first
+// says how to confirm (again: "Press again" or "Hold Play/Pause again").
+func (d *daemon) deleteRec(id, again string) q2spot.Reply {
+	j, ok := d.dl.byID(id)
+	if !ok {
+		return q2spot.Fail(q2spot.Unavailable, "It isn't in the record")
+	}
+	d.mu.Lock()
+	confirmed := d.del.id == id && time.Since(d.del.at) < deleteWithin
+	if confirmed {
+		d.del.id = ""
+	} else {
+		d.del.id, d.del.at = id, time.Now()
+	}
+	d.mu.Unlock()
+	if !confirmed {
+		return okMsg(again + " to delete “" + j.Title + "” from the card")
+	}
+	if _, err := d.dl.delete(j.Key); err != nil {
+		if errors.Is(err, errBusy) {
+			return q2spot.Fail(q2spot.Unavailable, "It's downloading; stop it in Downloads first")
+		}
+		logf("delete %q: %v", j.Title, err)
+		return q2spot.Fail(q2spot.Error, "Couldn't delete it: "+why(err))
+	}
+	d.askLibrary() // Q2 Pod's library forgets its songs
+	return okMsg("Deleted “" + j.Title + "” from the card")
+}
+
+// redo downloads a deleted record again.
+func (d *daemon) redo(id string) q2spot.Reply {
+	j, ok := d.dl.byID(id)
+	if !ok {
+		return q2spot.Fail(q2spot.Unavailable, "It isn't in the record")
+	}
+	if d.dl.add(again(j), true) == "queued" {
+		return okMsg("It's in Downloads already")
+	}
+	return okMsg("Downloading “" + j.Title + "” again")
 }

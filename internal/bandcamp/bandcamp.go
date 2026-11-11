@@ -511,6 +511,7 @@ type Tracklist struct {
 	Title    string
 	Subtitle string // a show's series
 	Artist   string // a release's artist, a playlist's curator
+	URL      string // its page
 	Image    Pic
 	Date     time.Time
 	Tracks   []Track
@@ -531,6 +532,7 @@ func (c *Client) Tracklist(ctx context.Context, kind string, id int64) (*Trackli
 			Tracklist struct {
 				Title       string        `json:"title"`
 				Subtitle    string        `json:"subtitle"`
+				ItemURL     string        `json:"itemUrl"`
 				ImageID     int64         `json:"imageId"`
 				IsArt       bool          `json:"isArt"`
 				Date        string        `json:"date"`
@@ -560,6 +562,9 @@ func (c *Client) Tracklist(ctx context.Context, kind string, id int64) (*Trackli
 		t := r.Tracklist
 		if first {
 			tl.Title, tl.Subtitle, tl.Image, tl.Date = t.Title, t.Subtitle, Pic{t.ImageID, t.IsArt}, parseDate(t.Date)
+			if t.ItemURL != "" {
+				tl.URL = resolve(Site+"/", t.ItemURL)
+			}
 			if t.Attribution != nil {
 				tl.Artist = t.Attribution.Name
 			}

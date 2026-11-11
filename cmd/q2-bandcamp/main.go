@@ -2,11 +2,10 @@
 // account needed: the editors' New and Notable picks, Bandcamp Daily's Album of the Day, featured
 // and fans' playlists, Bandcamp Radio's shows, and search. A press on an album downloads it as
 // bandcamp-dl does (the 128 kbps MP3s Bandcamp's own player streams, tagged, with the cover and
-// lyrics) into Bandcamp/ on the card, where it plays as local music; Play/Pause held on it plays it
-// at once instead. Playlists and radio shows can be played or downloaded, a download kept as an
-// album of its own. Playing goes through Q2 Pod's URL queue (its "urls" cap) and a proxy on the
-// Q2's loopback, so its player only ever sees plain HTTP. It runs from the card's .bandcamp folder,
-// copied to /tmp first.
+// lyrics) into Bandcamp/ on the card, where it plays as local music. A playlist's or a radio show's
+// songs download as an album of their own. Every download is kept in a record (record.go); an
+// album can be deleted from the card and stays in it, so Download the Top N passes it over. It runs
+// from the card's .bandcamp folder, copied to /tmp first.
 package main
 
 import (
@@ -29,7 +28,7 @@ import (
 	"github.com/group-a-study/q2-bandcamp/internal/tlsroots"
 )
 
-const version = "q2-v1.0"
+const version = "q2-v1.1"
 
 // transport carries every request to Bandcamp: TLS checked against the app's own roots, as the
 // firmware has none. Tests answer for Bandcamp instead.
@@ -39,12 +38,9 @@ var transport = func() http.RoundTripper {
 	return t
 }
 
-// idleFor is how long it stays with nothing to download, its page unused and nothing streamed,
-// before it stops (Wi-Fi stays on while a card app runs).
-var (
-	idleFor       = 15 * time.Minute
-	streamIdleFor = 30 * time.Minute
-)
+// idleFor is how long it stays with nothing to download and its page unused, before it stops
+// (Wi-Fi stays on while a card app runs).
+var idleFor = 15 * time.Minute
 
 type daemon struct {
 	dir     string // .bandcamp
@@ -54,8 +50,8 @@ type daemon struct {
 	state   *q2.State
 	cache   *cache
 	dl      *downloads
-	st      *streamer
 	art     *art
+	set     *settings
 	browse  string
 	control string
 
@@ -65,16 +61,16 @@ type daemon struct {
 	quit  chan struct{}
 	once  sync.Once
 	stop  atomic.Bool
+	del   struct {
+		id string
+		at time.Time
+	} // a delete asked for once, waiting for its second press
 }
-
-// proxyPort is the stream proxy's port on the loopback (the next free one if taken).
-var proxyPort = 8117
 
 func main() {
 	dir := flag.String("dir", "/mnt/mmc/.bandcamp", "the app's folder on the card")
 	card := flag.String("card", "/mnt/mmc", "the card's mount point; downloads go to its Bandcamp folder")
 	tmp := flag.String("tmp", "/tmp/q2-bandcamp", "the files shared with Q2 Pod: this with .state, .browse.sock, …")
-	flag.IntVar(&proxyPort, "proxy-port", proxyPort, "the stream proxy's port, on the loopback")
 	flag.Parse()
 	debug.SetGCPercent(50)
 	debug.SetMemoryLimit(40 << 20)
@@ -94,11 +90,11 @@ func start(dir, root, tmp string) *daemon {
 		cache: newCache(), browse: tmp + ".browse.sock", control: tmp + ".sock", used: time.Now(),
 		known: map[string]bandcamp.Album{}, quit: make(chan struct{})}
 	os.MkdirAll(dir, 0o755)
+	d.set = readSettings(filepath.Join(dir, "settings.json"))
 	d.dl = newDownloads(d, root, dir)
 	d.art = newArt(d, tmp+".art")
-	d.st = newStreamer(d, tmp)
-	if err := d.st.listen(proxyPort); err != nil {
-		logf("stream proxy: %v", err)
+	for _, old := range []string{".play", ".urls", ".lyrics"} { // v1.0's streaming, gone
+		os.RemoveAll(tmp + old)
 	}
 	d.writeState()
 	q2.Control(d.control, func(cmd []byte) {
@@ -113,7 +109,7 @@ func start(dir, root, tmp string) *daemon {
 }
 
 // run downloads until asked to stop, writes the status file every second, and stops by itself
-// once idle: nothing to download, its page unused, nothing streamed.
+// once idle: nothing to download, its page unused.
 func (d *daemon) run() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -126,7 +122,6 @@ func (d *daemon) run() {
 			d.stop.Store(true)
 			cancel()
 			<-done // the song under way ended, its partial kept; the queue saved
-			d.st.close()
 			d.state.Remove()
 			d.art.clear()
 			os.Remove(d.browse)
@@ -138,8 +133,8 @@ func (d *daemon) run() {
 			d.mu.Lock()
 			idle := time.Since(d.used)
 			d.mu.Unlock()
-			if !d.dl.pending() && idle > idleFor && d.st.idle() > streamIdleFor {
-				logf("nothing to download, the page unused for %v and nothing streamed: stopping", idleFor)
+			if !d.dl.pending() && idle > idleFor {
+				logf("nothing to download and the page unused for %v: stopping", idleFor)
 				d.shutdown()
 			}
 			if n%60 == 0 {

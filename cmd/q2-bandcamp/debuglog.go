@@ -16,7 +16,7 @@ import (
 // The debug log, which the user allowed for this app (2026-11-11): q2-bandcamp.log at the card's
 // root, where File Browser shows it. A line each for a start (and what the run before it left in
 // /tmp: a crash's message, the launcher's restarts and exit codes), each page Bandcamp was asked
-// for and how long it took, each job and song, failures and waits, streams started and proxied,
+// for and how long it took, each job and song, failures and waits, deletions,
 // memory every minute, and why it stopped. Each line is appended and synced, the file opened and
 // closed around it, so it never keeps the card busy; past logMax it starts again, the last one kept
 // as q2-bandcamp.old.log. The launcher (contrib/shanlingq2/launcher.sh) writes its own lines there.
@@ -96,8 +96,8 @@ func logStart(d *daemon) {
 	d.dl.mu.Lock()
 	queued, finished := len(d.dl.queue), len(d.dl.done)
 	d.dl.mu.Unlock()
-	logf("start %s (pid %d): card free %s, /tmp free %s, %s; %d jobs queued, %d finished; caps %q; proxy port %d",
-		version, os.Getpid(), free(q2.Card), free("/tmp"), memAvailable(), queued, finished, caps(), d.st.port)
+	logf("start %s (pid %d): card free %s, /tmp free %s, %s; %d jobs queued, %d finished; caps %q",
+		version, os.Getpid(), free(q2.Card), free("/tmp"), memAvailable(), queued, finished, caps())
 }
 
 // caps is the firmware's card-app features, as it lists them.
@@ -116,4 +116,12 @@ func logMemory(d *daemon) {
 	logf("memory: app heap %d MB, app system %d MB, %d goroutines; %s; /tmp free %s; %d jobs queued; up %v",
 		m.HeapAlloc>>20, m.Sys>>20, runtime.NumGoroutine(), memAvailable(), free("/tmp"), queued,
 		time.Since(started).Round(time.Second))
+}
+
+// errNote is " (err)" for a log line, "" without one.
+func errNote(err error) string {
+	if err == nil {
+		return ""
+	}
+	return " (" + err.Error() + ")"
 }
